@@ -25,6 +25,7 @@ mod docinfo;
 mod docmenu;
 mod editor;
 mod highlight;
+mod history;
 mod home;
 mod html;
 mod input;
