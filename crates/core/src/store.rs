@@ -680,7 +680,7 @@ impl Store {
         self.require_markdown_format()?;
         let t = now();
         self.index.insert(id.clone(), Meta { created: t, modified: t, markdown: true, name: Some(doc.title.text.trim().to_string()), ..Default::default() });
-        let text = format!("{front}{}", crate::markdown::write_file(doc, "", None));
+        let text = format!("{front}{}", crate::markdown::write_file_with(doc, "", &crate::markdown::Options { in_place: true, library_root: Some(&self.root), ..Default::default() }).text);
         if let Err(e) = write_atomic(&self.path(&id), text.as_bytes()).and_then(|_| self.save_index()) { self.index.remove(&id); return Err(e); }
         self.record_file_change(&id, None);
         Ok(id)

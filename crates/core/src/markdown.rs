@@ -167,9 +167,16 @@ impl Writer<'_> {
         if src.contains("://") && !src.starts_with("file://") || src.starts_with("data:") {
             return src.to_string();
         }
-        let Some(base) = self.opts.base else { return src.to_string() };
-        let raw = Path::new(src.strip_prefix("file://").unwrap_or(src));
         let root = self.opts.library_root.map(Path::to_path_buf).unwrap_or_else(crate::store::Store::root_dir);
+        let raw = Path::new(src.strip_prefix("file://").unwrap_or(src));
+        // A document in the library names the library's own files relative to
+        // it (`assets/…`), so moving the folder keeps the pictures.
+        let Some(base) = self.opts.base else {
+            return match raw.strip_prefix(&root) {
+                Ok(rel) if rel.components().next().is_some() => rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"),
+                _ => src.to_string(),
+            };
+        };
         // Relative sources left after `parse_file` are the library's (`assets/…`).
         let abs = if raw.is_absolute() { raw.to_path_buf() } else { root.join(raw) };
         if let Ok(rel) = abs.strip_prefix(base) {
@@ -310,13 +317,46 @@ pub fn parse_file(text: &str, title: &str, base: Option<&Path>) -> Document {
     let text = text.trim_start_matches('\u{feff}');
     let (_, body) = front_matter(text);
     let mut blocks = crate::paste::markdown_to_blocks(body, crate::paste::Off { file: true, alt: true, ..Default::default() });
-    if let Some(dir) = base {
-        resolve_images(&mut blocks, dir);
+    match base {
+        Some(dir) => resolve_images(&mut blocks, dir),
+        // A page in the library names its own pictures relative to it.
+        None => unescape_sources(&mut blocks),
     }
     if blocks.is_empty() {
         blocks.push(Block::text(""));
     }
     Document { title: RichText::plain(title), icon: None, cover: None, blocks }
+}
+
+/// Library-relative sources are written the way Markdown wants them
+/// (`assets/a%20b.png`); they point at the library's own files, so undo that.
+fn unescape_sources(blocks: &mut [Block]) {
+    for b in blocks.iter_mut() {
+        unescape_sources(&mut b.children);
+        if let BlockKind::Table(t) = &mut b.kind {
+            for cell in t.rows.iter_mut().flatten() {
+                unescape_sources(&mut cell.blocks);
+            }
+        }
+        let src = match &mut b.kind {
+            BlockKind::Image { src, .. } => src,
+            BlockKind::File(f) if f.src_kind != "token" => &mut f.src,
+            _ => continue,
+        };
+        if let Some(plain) = unescaped(src) {
+            *src = plain;
+        }
+    }
+}
+
+/// `src` with Markdown's escapes undone, when it names a file of the library
+/// (a relative path); URLs, data URIs and absolute paths are left alone.
+fn unescaped(src: &str) -> Option<String> {
+    if !src.contains('%') || src.starts_with('/') || src.contains(':') {
+        return None;
+    }
+    let plain = percent_decode(src);
+    (plain != src).then_some(plain)
 }
 
 /// `doc` written back as a Markdown file, after the file's `front` matter.
@@ -680,6 +720,23 @@ mod tests {
         let out = write_file(&doc, front_matter(src).0, Some(base));
         assert_eq!(out, src);
         assert_eq!(write_file(&parse_file(&out, "page", Some(base)), front_matter(&out).0, Some(base)), out);
+    }
+
+    /// A page in the library names its pictures relative to the library, so
+    /// moving the folder does not break them.
+    #[test]
+    fn library_pages_keep_their_images_relative() {
+        let root = Path::new(if cfg!(windows) { "C:/Users/me/Documents/Quiet.md" } else { "/Users/me/Documents/Quiet.md" });
+        let mut doc = Document::default();
+        doc.blocks.push(Block::new(
+            BlockKind::Image { src_kind: "src".into(), src: root.join("assets").join("a b.png").to_string_lossy().into_owned(), width: None, height: None, caption: None, crop: None },
+            RichText::default(),
+        ));
+        let out = write_file_with(&doc, "", &Options { in_place: true, library_root: Some(root), ..Default::default() }).text;
+        assert_eq!(out.trim_end(), "![](assets/a%20b.png)");
+        // And back: the escapes undone, still relative to the library.
+        let back = parse_file(&out, "page", None);
+        assert!(back.blocks.iter().any(|b| matches!(&b.kind, BlockKind::Image { src, .. } if src == "assets/a b.png")));
     }
 
     fn preserved(original: &str, edit: impl FnOnce(&mut Document)) -> String {
