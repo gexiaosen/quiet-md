@@ -314,11 +314,20 @@ pub fn resolve_images(blocks: &mut [Block], base: &Path) {
 /// the folder of a file outside the library, which relative images resolve
 /// against.
 pub fn parse_file(text: &str, title: &str, base: Option<&Path>) -> Document {
+    parse_file_in(text, title, base, None)
+}
+
+/// `parse_file`, plus the folder an Obsidian-style `![[name.png]]` is looked up
+/// in: a vault keeps its pictures in one place, not beside each page.
+pub fn parse_file_in(text: &str, title: &str, base: Option<&Path>, vault: Option<&Path>) -> Document {
     let text = text.trim_start_matches('\u{feff}');
     let (_, body) = front_matter(text);
     let mut blocks = crate::paste::markdown_to_blocks(body, crate::paste::Off { file: true, alt: true, ..Default::default() });
     match base {
-        Some(dir) => resolve_images(&mut blocks, dir),
+        Some(dir) => {
+            expand_embeds(&mut blocks, dir, vault);
+            resolve_images(&mut blocks, dir);
+        }
         // A page in the library names its own pictures relative to it.
         None => unescape_sources(&mut blocks),
     }
@@ -326,6 +335,52 @@ pub fn parse_file(text: &str, title: &str, base: Option<&Path>) -> Document {
         blocks.push(Block::text(""));
     }
     Document { title: RichText::plain(title), icon: None, cover: None, blocks }
+}
+
+/// The picture formats the editor shows (`src/editor/image.rs`); an embed of
+/// anything else keeps its text instead of turning into a block that would be
+/// dropped on save.
+const PICTURES: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// `![[name.png]]` — the embed Obsidian and OneNote exports write — as a
+/// picture, when that file sits beside the page and this app can show it.
+/// Anything else (`![[page#heading]]`, a missing file) stays the text it was,
+/// so an import never drops what it does not understand.
+fn expand_embeds(blocks: &mut [Block], base: &Path, vault: Option<&Path>) {
+    for b in blocks.iter_mut() {
+        expand_embeds(&mut b.children, base, vault);
+        if let BlockKind::Table(t) = &mut b.kind {
+            for cell in t.rows.iter_mut().flatten() {
+                expand_embeds(&mut cell.blocks, base, vault);
+            }
+        }
+        if !matches!(b.kind, BlockKind::Text) {
+            continue;
+        }
+        let Some((name, width)) = wiki_embed(&b.text.text) else { continue };
+        // Beside the page first, then the folder the pages were imported from.
+        let found = [Some(base), vault].into_iter().flatten().map(|dir| dir.join(&name)).find(|p| p.is_file());
+        // Only a picture this app can show: anything else stays the text it
+        // was, rather than being dropped when the page is saved.
+        let Some(path) = found else { continue };
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+        if !PICTURES.contains(&ext.as_str()) {
+            continue;
+        }
+        b.kind = BlockKind::Image { src_kind: "src".into(), src: path.to_string_lossy().into_owned(), width, height: None, caption: None, crop: None };
+        b.text = RichText::default();
+    }
+}
+
+/// `![[name.png]]` or `![[name.png|300]]`: the file and the width it asks for.
+fn wiki_embed(text: &str) -> Option<(String, Option<f32>)> {
+    let inner = text.trim().strip_prefix("![[")?.strip_suffix("]]")?;
+    let (name, width) = match inner.split_once('|') {
+        Some((name, size)) => (name.trim(), size.trim().parse::<f32>().ok().filter(|w| *w > 0.)),
+        None => (inner.trim(), None),
+    };
+    // `![[page#heading]]` embeds part of another page, not a file.
+    (!name.is_empty() && !name.contains('#')).then(|| (name.to_string(), width))
 }
 
 /// Library-relative sources are written the way Markdown wants them
@@ -737,6 +792,30 @@ mod tests {
         // And back: the escapes undone, still relative to the library.
         let back = parse_file(&out, "page", None);
         assert!(back.blocks.iter().any(|b| matches!(&b.kind, BlockKind::Image { src, .. } if src == "assets/a b.png")));
+    }
+
+    /// `![[a.png]]`, as Obsidian and OneNote exports write it, becomes the
+    /// picture beside the page or at the top of the folder it came from; what
+    /// cannot be resolved stays text.
+    #[test]
+    fn wiki_embeds_become_pictures_when_the_file_is_there() {
+        let root = std::env::temp_dir().join(format!("fdl-embed-{}", uuid::Uuid::new_v4()));
+        let notes = root.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("p 1.png"), b"png").unwrap();
+        std::fs::write(root.join("vault.png"), b"png").unwrap();
+        std::fs::write(root.join("drawing.svg"), b"<svg/>").unwrap();
+        let src = "4、\n\n![[p 1.png]]\n\n![[p 1.png|300]]\n\n![[vault.png]]\n\n![[missing.png]]\n\n![[page#heading]]\n\n![[drawing.svg]]\n";
+        let doc = parse_file_in(src, "page", Some(&notes), Some(&root));
+        let name = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        let pics: Vec<(String, Option<f32>)> = doc.blocks.iter().filter_map(|b| match &b.kind {
+            BlockKind::Image { src, width, .. } => Some((src.clone(), *width)),
+            _ => None,
+        }).collect();
+        assert_eq!(pics, vec![(name(notes.join("p 1.png")), None), (name(notes.join("p 1.png")), Some(300.)), (name(root.join("vault.png")), None)]);
+        let texts: Vec<&str> = doc.blocks.iter().map(|b| b.text.text.as_str()).filter(|t| !t.is_empty()).collect();
+        assert_eq!(texts, vec!["4、", "![[missing.png]]", "![[page#heading]]", "![[drawing.svg]]"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn preserved(original: &str, edit: impl FnOnce(&mut Document)) -> String {

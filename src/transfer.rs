@@ -331,7 +331,7 @@ impl Workspace {
         for p in paths {
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
             let made = match ext.as_str() {
-                _ if crate::local_files::is_markdown_path(p) => self.import_markdown(p, None),
+                _ if crate::local_files::is_markdown_path(p) => self.import_markdown(p, None, None),
                 e if MARKDOWN_EXTS.contains(&e) => markdown_document(p).map_err(anyhow::Error::from).and_then(|doc| self.store.create_from(&doc)),
                 "xml" => self.store.import(p),
                 _ => Err(anyhow::anyhow!("文件格式不支持")),
@@ -420,12 +420,12 @@ impl Workspace {
 
     /// A Markdown file copied into the library, still Markdown: its local
     /// images are copied into the library's assets.
-    fn import_markdown(&mut self, path: &Path, parent: Option<&str>) -> anyhow::Result<String> {
+    fn import_markdown(&mut self, path: &Path, parent: Option<&str>, vault: Option<&Path>) -> anyhow::Result<String> {
         let bytes = crate::store::read_bounded(path, IMPORT_FILE_LIMIT)?;
         let text = String::from_utf8_lossy(&bytes);
         let text = text.trim_start_matches('\u{feff}');
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().trim().to_string();
-        let mut doc = crate::markdown::parse_file(text, &stem, path.parent());
+        let mut doc = crate::markdown::parse_file_in(text, &stem, path.parent(), vault);
         crate::editor::image::localize_pasted_images(&mut doc.blocks);
         if doc.blocks.is_empty() { doc.blocks.push(Block::text("")); }
         let id = self.store.create_markdown(&doc, crate::markdown::front_matter(text).0)?;
@@ -456,7 +456,7 @@ impl Workspace {
         }
         let file_before = self.store.track_file_changes();
         let mut failed = 0;
-        let top = self.import_tree(&tree, parent.as_deref(), &mut failed);
+        let top = self.import_tree(&tree, parent.as_deref(), dir, &mut failed);
         self.remember_files(file_before, crate::settings::tr("导入文件夹", "Import folder"));
         self.entries = self.store.list();
         self.sort();
@@ -471,14 +471,14 @@ impl Workspace {
     }
 
     /// One scanned folder as a library folder under `parent`; its id.
-    fn import_tree(&mut self, t: &Scanned, parent: Option<&str>, failed: &mut usize) -> Option<String> {
+    fn import_tree(&mut self, t: &Scanned, parent: Option<&str>, root: &Path, failed: &mut usize) -> Option<String> {
         let id = match self.store.create_folder(&t.name, parent) {
             Ok(id) => id,
             Err(_) => { *failed += t.files; return None; }
         };
-        for sub in &t.dirs { self.import_tree(sub, Some(&id), failed); }
+        for sub in &t.dirs { self.import_tree(sub, Some(&id), root, failed); }
         for p in &t.docs {
-            let made = if crate::local_files::is_markdown_path(p) { self.import_markdown(p, Some(&id)) }
+            let made = if crate::local_files::is_markdown_path(p) { self.import_markdown(p, Some(&id), Some(root)) }
                 else { self.store.import(p).and_then(|doc| self.store.set_parent(&doc, Some(&id)).map(|_| doc)) };
             if made.is_err() { *failed += 1; }
         }
