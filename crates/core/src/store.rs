@@ -285,9 +285,50 @@ fn with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// The folder a library keeps its own copies in: hidden, beside the file they
+/// belong to, so a library folder shows documents and pictures only.
+fn backup_path(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let dir = path.parent().map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf).join(".backup");
+    dir.join(format!("{name}{suffix}"))
+}
+
+/// Copies older builds left in the open (`index.json.bak`, a damaged index set
+/// aside as `index.json.corrupt-<time>`, `index.before-folders.json`) move into
+/// the hidden folder, once; the library itself never writes them there again.
+/// A copy already in the folder wins, so nothing is overwritten.
+fn tidy_backups(root: &std::path::Path) {
+    let move_in = |from: PathBuf, dir: &std::path::Path, name: &str| {
+        let to = dir.join(".backup").join(name);
+        if to.exists() || std::fs::create_dir_all(dir.join(".backup")).is_err() { return }
+        let _ = std::fs::rename(&from, &to);
+    };
+    for dir in [root.to_path_buf(), root.join("trash")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let plain = name.strip_suffix(".bak");
+            let spare = plain.is_some_and(|stem| stem == "index.json") || name.starts_with("index.json.corrupt-");
+            if !spare { continue }
+            move_in(entry.path(), &dir, plain.unwrap_or(&name));
+        }
+    }
+    let legacy = root.join("index.before-folders.json");
+    if legacy.is_file() { move_in(legacy, root, "index.before-folders.json"); }
+}
+
+/// The index as it was before pages became folders, kept once in the hidden
+/// folder so `migrate_folders` can be undone by hand.
+fn write_index_before_folders(root: &std::path::Path, index: &HashMap<String, Meta>) -> Result<()> {
+    let path = root.join(".backup").join("index.before-folders.json");
+    if path.exists() { return Ok(()) }
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+    write_atomic(&path, &serde_json::to_vec_pretty(index)?)
+}
+
 /// Read a JSON index written by `save_json`. A file that exists but does not
-/// parse is set aside as `<name>.corrupt-<time>` (never overwritten) and the
-/// previous version, `<name>.bak`, is used instead.
+/// parse is set aside as `index.json.corrupt-<time>` (never overwritten) in the
+/// hidden `.backup` folder, and the previous version there is used instead.
 fn load_json<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path, what: &str, warnings: &mut Vec<String>) -> T {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -300,10 +341,15 @@ fn load_json<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path, w
     if let Ok(v) = serde_json::from_slice(&bytes) {
         return v;
     }
-    let aside = with_suffix(path, &format!(".corrupt-{}", now()));
+    let aside = backup_path(path, &format!(".corrupt-{}", now()));
+    if let Some(dir) = aside.parent() { let _ = std::fs::create_dir_all(dir); }
     let _ = std::fs::rename(path, &aside);
     let name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    match std::fs::read(with_suffix(path, ".bak")).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+    // The previous version, and — in a library that has not been tidied yet —
+    // the one older builds left beside the file.
+    let previous = std::iter::once(backup_path(path, "")).chain(std::iter::once(with_suffix(path, ".bak")))
+        .find_map(|p| std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok()));
+    match previous {
         Some(v) => {
             warnings.push(format!("{what}已损坏，已从备份恢复（原文件保留为 {name}）"));
             v
@@ -320,12 +366,14 @@ fn reread<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-/// Atomically replace a JSON index, keeping the version it replaces as
-/// `<name>.bak` for `load_json`.
+/// Atomically replace a JSON index, keeping the version it replaces in the
+/// hidden `.backup` folder for `load_json`.
 fn save_json<T: Serialize>(path: &std::path::Path, v: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(v)?;
     if path.exists() {
-        write_atomic(&with_suffix(path, ".bak"), &std::fs::read(path)?)?;
+        let previous = backup_path(path, "");
+        if let Some(dir) = previous.parent() { std::fs::create_dir_all(dir)?; }
+        write_atomic(&previous, &std::fs::read(path)?)?;
     }
     write_atomic(path, &bytes)
 }
@@ -387,6 +435,9 @@ impl Store {
 
     pub fn open_at(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(root.join("docs"))?;
+        // Copies older builds left in the library folder itself go into the
+        // hidden `.backup` folder, before anything reads them.
+        tidy_backups(&root);
         let mut warnings = vec![];
         let marker = root.join("format.json");
         match std::fs::read(&marker).ok().and_then(|b| serde_json::from_slice::<FormatMarker>(&b).ok()) {
@@ -1365,9 +1416,11 @@ mod tests {
         assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
         assert!(s.warnings[0].contains("已从备份恢复"));
         assert!(s.list()[0].meta.pinned);
-        // The damaged file is kept for inspection, not overwritten.
-        let kept = std::fs::read_dir(&lib.0).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("index.json.corrupt-")).count();
-        assert_eq!(kept, 1);
+        // The damaged file is kept for inspection, not overwritten — in the
+        // hidden folder, not in the library folder itself.
+        let spare = |dir: &std::path::Path| std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("index.json.corrupt-")).count();
+        assert_eq!(spare(&lib.0.join(".backup")), 1);
+        assert_eq!(spare(&lib.0), 0);
     }
 
     #[test]
@@ -1376,10 +1429,41 @@ mod tests {
         let mut s = lib.open();
         s.create_from(&doc("一")).unwrap();
         std::fs::write(lib.0.join("index.json"), b"garbage").unwrap();
-        let _ = std::fs::remove_file(lib.0.join("index.json.bak"));
+        let _ = std::fs::remove_file(lib.0.join(".backup").join("index.json"));
         let mut s = lib.open();
         assert!(s.warnings[0].contains("没有可用备份"));
         assert_eq!(s.list().len(), 1);
+    }
+
+    /// A library written by an older build keeps `index.json.bak` and friends
+    /// beside the index; opening it moves them into the hidden folder once, so
+    /// the library folder looks the same as a new one.
+    #[test]
+    fn spare_copies_older_builds_left_beside_the_index_move_into_the_hidden_folder() {
+        let lib = Lib::new("tidy");
+        let mut s = lib.open();
+        let id = s.create_from(&doc("一")).unwrap();
+        let index = std::fs::read(lib.0.join("index.json")).unwrap();
+        drop(s);
+        for name in ["index.json.bak", "index.json.corrupt-1", "trash/index.json.bak", "index.before-folders.json"] {
+            std::fs::create_dir_all(lib.0.join(name).parent().unwrap()).unwrap();
+            std::fs::write(lib.0.join(name), &index).unwrap();
+        }
+        let mut s = lib.open();
+        assert_eq!(s.warnings, Vec::<String>::new());
+        // The index still reads, and the page is still there.
+        assert_eq!(s.list().len(), 1);
+        assert_eq!(s.list()[0].id, id);
+        for name in ["index.json.bak", "index.json.corrupt-1", "trash/index.json.bak", "index.before-folders.json"] {
+            assert!(!lib.0.join(name).exists(), "{name} is still in the open");
+        }
+        for name in [".backup/index.json", ".backup/index.json.corrupt-1", "trash/.backup/index.json", ".backup/index.before-folders.json"] {
+            assert!(lib.0.join(name).is_file(), "{name} moved into the hidden folder");
+        }
+        // And the next save keeps writing there, not where it used to.
+        s.set_pinned(&id, true).unwrap();
+        assert!(lib.0.join(".backup/index.json").is_file());
+        assert!(!lib.0.join("index.json.bak").exists());
     }
 
     #[test]
@@ -1410,7 +1494,7 @@ mod tests {
         inside.sort_by_key(|e| (e.meta.place(), e.id.clone()));
         let titles: Vec<&str> = inside.iter().map(|e| e.title.as_str()).collect();
         assert_eq!(titles, ["父", "子一", "子二"], "the page first, then its children oldest first");
-        assert!(lib.0.join("index.before-folders.json").exists());
+        assert!(lib.0.join(".backup/index.before-folders.json").exists());
         assert!(String::from_utf8(std::fs::read(lib.0.join("format.json")).unwrap()).unwrap().contains(&BASE_FORMAT.to_string()));
     }
 

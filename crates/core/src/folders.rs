@@ -11,15 +11,13 @@ impl Store {
         let _lock = self.begin_write()?;
         let marker: FormatMarker = serde_json::from_slice(&std::fs::read(self.root.join("format.json"))?)?;
         if marker.format < BASE_FORMAT {
-            let backup = self.root.join("index.before-folders.json");
-            if !backup.exists() { write_atomic(&backup, &serde_json::to_vec_pretty(&self.index)?)?; }
+            write_index_before_folders(&self.root, &self.index)?;
         }
         let legacy: Vec<String> = self.index.values().filter_map(|m| m.parent.clone())
             .filter(|id| self.index.get(id).is_some_and(|m| m.folder.is_none()) && self.path(id).is_file())
             .collect::<std::collections::HashSet<_>>().into_iter().collect();
         if !legacy.is_empty() {
-            let backup = self.root.join("index.before-folders.json");
-            if !backup.exists() { write_atomic(&backup, &serde_json::to_vec_pretty(&self.index)?)?; }
+            write_index_before_folders(&self.root, &self.index)?;
             let previous = self.index.clone();
             let mapping: HashMap<String, String> = legacy.iter().map(|id| (id.clone(), uuid::Uuid::new_v4().to_string())).collect();
             for id in &legacy {
