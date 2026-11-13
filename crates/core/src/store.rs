@@ -365,6 +365,34 @@ pub fn read_bounded(path: &std::path::Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The library images a document names, by file name: `assets/<name>` in
+/// Markdown and in DocxXML alike, absolute or relative, escaped or not. Images
+/// in a sub-folder of `assets/` (the guides, the remote cache) are not listed.
+fn asset_files(text: &str) -> Vec<String> {
+    const MARK: &str = "assets/";
+    let mut out = vec![];
+    let mut rest = text;
+    while let Some(i) = rest.find(MARK) {
+        let after = &rest[i + MARK.len()..];
+        if after.is_empty() {
+            break;
+        }
+        // A name ends where the link or the attribute does.
+        let end = after.find([')', '"', '\'', '\n', '<', '>', ']']).unwrap_or(after.len());
+        let name = crate::markdown::percent_decode(after[..end].trim());
+        if !name.is_empty() && !name.contains('/') {
+            out.push(name);
+        }
+        rest = &after[if end == 0 { 1 } else { end }..];
+    }
+    out
+}
+
+/// Whether `text` still names that image (Markdown escapes its spaces).
+fn names_asset(text: &str, name: &str) -> bool {
+    text.contains(name) || text.contains(&name.replace(' ', "%20"))
+}
+
 impl Store {
     /// `QUIET_MD_HOME`, else a folder of
     /// its own in the user's Documents, where they can see and back it up.
@@ -605,6 +633,21 @@ impl Store {
     fn save_now(&mut self, id: &str, doc: &Document) -> Result<Meta> {
         let disk = if self.is_markdown(id) || self.loaded.borrow().contains_key(id) { std::fs::read_to_string(self.path(id)).ok() } else { None };
         let (xml, copies) = self.serialize_with_copies(id, doc, disk.as_deref());
+        // The images this save stops naming leave `assets/` with it, once
+        // nothing else in the library names them.
+        let dropped = {
+            let loaded = self.loaded.borrow();
+            let read;
+            let before: &str = match disk.as_deref().or_else(|| loaded.get(id).map(String::as_str)) {
+                Some(text) => text,
+                None => {
+                    read = std::fs::read_to_string(self.path(id)).unwrap_or_default();
+                    &read
+                }
+            };
+            let kept = asset_files(&xml);
+            asset_files(before).into_iter().filter(|n| !kept.contains(n)).collect::<Vec<_>>()
+        };
         if let Some(previous) = self.loaded.borrow().get(id) {
             let disk = disk.as_deref().ok_or_else(|| anyhow::anyhow!("无法读取文档"))?;
             let message = if self.index.get(id).is_some_and(Meta::local) { "文件已在别处被修改，未覆盖磁盘内容。请另存副本或重新打开文件" } else { "文档已被另一个实例修改，未覆盖磁盘内容。请另存副本或重新载入磁盘版本" };
@@ -635,7 +678,39 @@ impl Store {
         m.modified = t;
         let m = m.clone();
         self.save_index()?;
+        self.drop_unused_assets(&dropped);
         Ok(m)
+    }
+
+    /// Images in `assets/` that `names` used and nothing else names any more:
+    /// the pages in the library, the 回收站 and the 本机文件 the index keeps are
+    /// all searched. A page that is only in the 回收站 still names its pictures,
+    /// so they come back when it is restored.
+    fn drop_unused_assets(&self, names: &[String]) {
+        let mut pending: Vec<PathBuf> = names.iter().map(|n| self.root.join("assets").join(n)).filter(|p| p.is_file()).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let mut places: Vec<PathBuf> = vec![];
+        for dir in [self.root.join("docs"), self.root.join("trash")] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                places.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_file()));
+            }
+        }
+        places.extend(self.index.values().filter_map(|m| m.path.as_deref()).map(PathBuf::from));
+        for p in places {
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            pending.retain(|f| {
+                let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                !names_asset(&text, &name)
+            });
+            if pending.is_empty() {
+                return;
+            }
+        }
+        for p in pending {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     pub fn create(&mut self) -> Result<(String, Document)> {
@@ -904,7 +979,11 @@ impl Store {
     /// 彻底删除 a page from the 回收站, with the pages that went with it.
     pub fn purge(&mut self, id: &str) -> Result<()> {
         let _lock = self.begin_write()?;
+        let mut used = vec![];
         for k in self.trash_group(id) {
+            if let Ok(text) = std::fs::read_to_string(self.trash_path(&k)) {
+                used.extend(asset_files(&text));
+            }
             match std::fs::remove_file(self.trash_path(&k)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -912,7 +991,10 @@ impl Store {
             }
             self.trash.remove(&k);
         }
-        self.save_trash()
+        self.save_trash()?;
+        // A page that is gone for good takes its pictures with it.
+        self.drop_unused_assets(&used);
+        Ok(())
     }
 
     /// Copy a DocxXML file into the library under a fresh id.
@@ -1136,6 +1218,69 @@ mod tests {
         s.restore(&id).unwrap();
         assert!(file.is_file());
         assert_eq!(s.load(&id).unwrap().title.text, "Renamed");
+    }
+
+    /// An image block for a picture in the library's `assets/`.
+    fn picture(path: &std::path::Path) -> crate::model::Block {
+        use crate::model::{Block, BlockKind};
+        Block::new(BlockKind::Image { src_kind: "src".into(), src: path.to_string_lossy().into_owned(), width: None, height: None, caption: None, crop: None }, crate::model::RichText::default())
+    }
+
+    /// #113: a picture taken out of a page leaves the library with it.
+    #[test]
+    fn an_image_no_page_uses_anymore_leaves_the_library() {
+        let lib = Lib::new("asset-save");
+        std::fs::create_dir_all(lib.0.join("assets")).unwrap();
+        let pic = lib.0.join("assets").join("a picture.png");
+        std::fs::write(&pic, b"png").unwrap();
+        let mut s = lib.open();
+        let mut d = doc("with a picture");
+        d.blocks.push(picture(&pic));
+        let id = s.create_markdown(&d, "").unwrap();
+        assert!(pic.is_file());
+        // Taken out of the page and saved: the copy goes too.
+        let mut d = s.load(&id).unwrap();
+        d.blocks.pop();
+        s.save(&id, &d).unwrap();
+        assert!(!pic.exists());
+
+        // While another page still names it, it stays.
+        std::fs::write(&pic, b"png").unwrap();
+        let mut one = doc("one");
+        one.blocks.push(picture(&pic));
+        let one = s.create_markdown(&one, "").unwrap();
+        let mut two = doc("two");
+        two.blocks.push(picture(&pic));
+        let two = s.create_markdown(&two, "").unwrap();
+        let mut text = s.load(&one).unwrap();
+        text.blocks.pop();
+        s.save(&one, &text).unwrap();
+        assert!(pic.is_file(), "另一篇还在用它");
+        let mut text = s.load(&two).unwrap();
+        text.blocks.pop();
+        s.save(&two, &text).unwrap();
+        assert!(!pic.exists());
+    }
+
+    /// A page restored from the 回收站 keeps its pictures; one deleted for good
+    /// does not.
+    #[test]
+    fn purging_a_page_removes_its_pictures() {
+        let lib = Lib::new("asset-purge");
+        std::fs::create_dir_all(lib.0.join("assets")).unwrap();
+        let pic = lib.0.join("assets").join("pic.png");
+        std::fs::write(&pic, b"png").unwrap();
+        let mut s = lib.open();
+        let mut d = doc("with a picture");
+        d.blocks.push(picture(&pic));
+        let id = s.create_markdown(&d, "").unwrap();
+        s.delete(&id, None).unwrap();
+        assert!(pic.is_file(), "回收站里的页面还得能还原图片");
+        s.restore(&id).unwrap();
+        assert!(pic.is_file());
+        s.delete(&id, None).unwrap();
+        s.purge(&id).unwrap();
+        assert!(!pic.exists());
     }
 
     #[test]
