@@ -311,7 +311,7 @@ fn thumb_block_in(b: &crate::model::Block, depth: usize, inherited: Hsla, quote:
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SortDir { Asc, Desc }
+pub(crate) enum SortDir { Asc, Desc }
 impl SortDir {
     fn key(self) -> &'static str { match self { Self::Asc => "asc", Self::Desc => "desc" } }
     fn of(key: &str) -> Self { if key == "asc" { Self::Asc } else { Self::Desc } }
@@ -320,7 +320,7 @@ impl SortDir {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HomeSort { Manual, Visited, Modified, Created, Title }
+pub(crate) enum HomeSort { Manual, Visited, Modified, Created, Title }
 impl HomeSort {
     fn key(self) -> &'static str { match self { Self::Manual => "manual", Self::Visited => "visited", Self::Modified => "modified", Self::Created => "created", Self::Title => "title" } }
     fn of(key: &str) -> Self { match key { "manual" => Self::Manual, "modified" => Self::Modified, "created" => Self::Created, "title" => Self::Title, _ => Self::Visited } }
@@ -389,6 +389,12 @@ impl Default for Home {
 }
 
 impl Home {
+    /// The page list's current order, for anything else that lists pages
+    /// (the sidebar's tree).
+    pub(crate) fn order(&self) -> Order {
+        Order { field: self.sort, dir: self.sort_dir, folders_first: self.folders_first }
+    }
+
     pub(crate) fn anchor(&self, key: &str) -> Option<Bounds<Pixels>> {
         self.anchors.borrow().get(key).copied()
     }
@@ -431,23 +437,39 @@ fn sort_glyph(dir: SortDir, size: f32) -> Svg {
 /// Sort 主页 and a folder's page. 手动排序 is the sidebar's order; the
 /// automatic ones never write it, and fall back to it (then the id) for equal
 /// values, so equal pages keep the order the user arranged by hand.
-fn sort_entries(v: &mut [Entry], field: HomeSort, dir: SortDir, folders_first: bool) {
-    if field == HomeSort::Manual {
+pub(crate) fn sort_entries(v: &mut [Entry], order: Order) {
+    if order.field == HomeSort::Manual {
         v.sort_by(|a, b| (a.meta.place(), &a.id).cmp(&(b.meta.place(), &b.id)));
         return;
     }
-    v.sort_by(|a, b| {
-        let asc = |o: std::cmp::Ordering| if dir == SortDir::Asc { o } else { o.reverse() };
-        let order = match field {
+    v.sort_by(|a, b| order.cmp(a, b));
+}
+
+/// How pages are ordered, as one value: 主页's setting, used there and by the
+/// sidebar's tree so both lists always agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Order {
+    pub field: HomeSort,
+    pub dir: SortDir,
+    pub folders_first: bool,
+}
+
+impl Order {
+    pub(crate) fn cmp(&self, a: &Entry, b: &Entry) -> std::cmp::Ordering {
+        if self.field == HomeSort::Manual {
+            return (a.meta.place(), &a.id).cmp(&(b.meta.place(), &b.id));
+        }
+        let asc = |o: std::cmp::Ordering| if self.dir == SortDir::Asc { o } else { o.reverse() };
+        let order = match self.field {
             HomeSort::Title => asc(a.title.cmp(&b.title)),
             HomeSort::Visited => asc(visited(a).cmp(&visited(b))),
             HomeSort::Modified => asc(a.meta.modified.cmp(&b.meta.modified)),
             HomeSort::Created => asc(a.meta.created.cmp(&b.meta.created)),
             HomeSort::Manual => std::cmp::Ordering::Equal,
         };
-        let group = if folders_first { b.meta.folder.is_some().cmp(&a.meta.folder.is_some()) } else { std::cmp::Ordering::Equal };
+        let group = if self.folders_first { b.meta.folder.is_some().cmp(&a.meta.folder.is_some()) } else { std::cmp::Ordering::Equal };
         group.then(order).then_with(|| a.meta.place().cmp(&b.meta.place())).then_with(|| a.id.cmp(&b.id))
-    });
+    }
 }
 
 fn visited(e: &Entry) -> u64 {
@@ -583,7 +605,7 @@ impl Workspace {
 
     /// Mix folders and documents unless the user explicitly groups folders first.
     fn sorted_entries(&self, mut v: Vec<Entry>) -> Vec<Entry> {
-        sort_entries(&mut v, self.home.sort, self.home.sort_dir, self.home.folders_first);
+        sort_entries(&mut v, self.home.order());
         v
     }
 
@@ -1118,7 +1140,7 @@ impl Workspace {
 #[cfg(test)]
 mod sort_tests {
     // Not `use super::*`: it would bring in gpui's `test` attribute macro.
-    use super::{HomeSort, SortDir, sort_entries};
+    use super::{HomeSort, Order, SortDir, sort_entries};
     use crate::store::Entry;
 
     fn page(id: &str, title: &str, modified: u64, created: u64, order: u64, folder: bool) -> Entry {
@@ -1151,15 +1173,15 @@ mod sort_tests {
             page("b", "Apple", 10, 100, 2, false),
             page("c", "Cherry", 30, 300, 1, false),
         ];
-        sort_entries(&mut v, HomeSort::Modified, SortDir::Desc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Modified, dir: SortDir::Desc, folders_first: false });
         assert_eq!(ids(&v), ["c", "a", "b"]);
-        sort_entries(&mut v, HomeSort::Modified, SortDir::Asc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Modified, dir: SortDir::Asc, folders_first: false });
         assert_eq!(ids(&v), ["b", "a", "c"]);
-        sort_entries(&mut v, HomeSort::Created, SortDir::Desc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Created, dir: SortDir::Desc, folders_first: false });
         assert_eq!(ids(&v), ["c", "a", "b"]);
-        sort_entries(&mut v, HomeSort::Title, SortDir::Asc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Title, dir: SortDir::Asc, folders_first: false });
         assert_eq!(ids(&v), ["b", "a", "c"]);
-        sort_entries(&mut v, HomeSort::Title, SortDir::Desc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Title, dir: SortDir::Desc, folders_first: false });
         assert_eq!(ids(&v), ["c", "a", "b"]);
     }
 
@@ -1171,7 +1193,7 @@ mod sort_tests {
             // Never placed by hand: above the placed ones, newest first.
             page("c", "C", 50, 50, 0, false),
         ];
-        sort_entries(&mut v, HomeSort::Manual, SortDir::Desc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Manual, dir: SortDir::Desc, folders_first: false });
         assert_eq!(ids(&v), ["c", "b", "a"]);
     }
 
@@ -1179,25 +1201,25 @@ mod sort_tests {
     fn equal_values_keep_the_hand_order() {
         // Same modification time: the hand order decides, in either direction.
         let mut v = vec![page("a", "A", 10, 10, 2, false), page("b", "B", 10, 10, 1, false)];
-        sort_entries(&mut v, HomeSort::Modified, SortDir::Desc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Modified, dir: SortDir::Desc, folders_first: false });
         assert_eq!(ids(&v), ["b", "a"]);
-        sort_entries(&mut v, HomeSort::Modified, SortDir::Asc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Modified, dir: SortDir::Asc, folders_first: false });
         assert_eq!(ids(&v), ["b", "a"]);
         // Title has no eponymous column, but sorts the same way.
         let mut v = vec![page("a", "Same", 10, 10, 2, false), page("b", "Same", 20, 20, 1, false)];
-        sort_entries(&mut v, HomeSort::Title, SortDir::Asc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Title, dir: SortDir::Asc, folders_first: false });
         assert_eq!(ids(&v), ["b", "a"]);
     }
 
     #[test]
     fn folders_first_groups_only_when_asked() {
         let mut v = vec![page("d", "Doc", 30, 30, 2, false), page("f", "Folder", 20, 20, 3, true)];
-        sort_entries(&mut v, HomeSort::Modified, SortDir::Desc, false);
+        sort_entries(&mut v, Order { field: HomeSort::Modified, dir: SortDir::Desc, folders_first: false });
         assert_eq!(ids(&v), ["d", "f"]);
-        sort_entries(&mut v, HomeSort::Modified, SortDir::Desc, true);
+        sort_entries(&mut v, Order { field: HomeSort::Modified, dir: SortDir::Desc, folders_first: true });
         assert_eq!(ids(&v), ["f", "d"]);
         // 手动排序 never groups: it is the order the sidebar shows.
-        sort_entries(&mut v, HomeSort::Manual, SortDir::Desc, true);
+        sort_entries(&mut v, Order { field: HomeSort::Manual, dir: SortDir::Desc, folders_first: true });
         assert_eq!(ids(&v), ["d", "f"]);
     }
 }
