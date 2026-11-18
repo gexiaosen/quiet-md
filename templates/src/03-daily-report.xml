@@ -1,4 +1,4 @@
-<title>日报</title>
+<title icon="✅" cover="preset:geometry-2">日报</title>
 <p>日期：　年　月　日　·　星期　·　撰写人：</p>
 <h2>今日完成</h2>
 <checkbox done="false">用结果说话：做了什么，产生了什么变化</checkbox>
