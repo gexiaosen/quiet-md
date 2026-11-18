@@ -10,6 +10,7 @@ fn main() {
     let skip: Vec<&str> = SKIP.iter().copied().chain((!linux).then_some("fonts/emoji/")).collect();
     embed("assets", "assets.rs", &skip);
     embed("shared-mock/library", "guides.rs", &[]);
+    embed("templates", "templates.rs", &[]);
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") { windows_resources(); }
 }
 

@@ -300,6 +300,8 @@ pub struct Workspace {
     min_w: f32,
     pub folder_current: Option<String>,
     pub create_menu: Option<(Option<String>, Point<Pixels>)>,
+    /// 新建 › 从模板新建: the folder it creates into, and where its list hangs.
+    pub template_menu: Option<(Option<String>, Point<Pixels>)>,
     /// The header's 导入 menu: the folder it imports into, and where it hangs.
     pub import_menu: Option<(Option<String>, Point<Pixels>)>,
     /// The header's … menu on Home (None) or a folder page: where it hangs.
@@ -561,6 +563,7 @@ impl Workspace {
             sidebar_drag: false,
             folder_current: None,
             create_menu: None,
+            template_menu: None,
             import_menu: None,
             place_menu: None,
             folder_drag: Default::default(),
@@ -611,6 +614,9 @@ impl Workspace {
             _subs: subs,
         };
         ws.sort();
+        // 模板 live beside the index: write the built-ins a fresh library (or a
+        // library that lost one) is missing. Existing files are never touched.
+        ws.seed_templates();
         ws.load_home();
         // An empty library opens on 主页's empty state; only a quick note
         // window starts a document of its own. The main window returns to the
@@ -1684,6 +1690,7 @@ impl Render for Workspace {
         let home_drag_overlay = self.render_home_drag_overlay(window, cx);
         let file_drop = self.render_file_drop(window, cx);
         let create_menu = self.render_create_menu(cx);
+        let template_menu = self.render_template_menu(cx);
         let import_menu = self.render_import_menu(cx);
         let place_menu = self.render_place_menu(cx);
         let search = self.render_search(window, cx);
@@ -1887,6 +1894,7 @@ impl Render for Workspace {
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())).with_priority(20)))
             .children(home_drag_overlay)
             .children(create_menu)
+            .children(template_menu)
             .children(import_menu)
             .children(place_menu)
             .children(toast)
