@@ -34,6 +34,12 @@ impl Workspace {
                 self.search.update(cx, |s, cx| s.set_text("", cx));
                 self.open(&id, window, cx);
                 if let Some(ed) = &self.editor { { let f = ed.read(cx).focus.clone(); window.focus(&f, cx); } }
+                // A new page starts blank and offers the templates over it:
+                // picking one fills this same document in. Markdown files and
+                // a library with no templates get no sheet.
+                if !markdown && !self.template_cards.is_empty() {
+                    self.template_picker = Some(id);
+                }
             }
             Err(e) => self.status = crate::app::SaveStatus::Failed(crate::localized_format!("新建失败：{}", "Could not create document: {}", crate::settings::diagnostic(&e.to_string()))),
         }
@@ -139,24 +145,11 @@ impl Workspace {
         let (parent, pos) = self.create_menu.clone()?;
         let folder_parent = parent.clone();
         let row = |id: &'static str, glyph: &'static str, label: &'static str| crate::ui::menu_row(id, SharedString::from(id)).child(icon(glyph, 16., Theme::icon())).child(label);
-        let (doc_parent, md_parent, board_parent, template_parent) = (parent.clone(), parent.clone(), parent.clone(), parent.clone());
-        // 从模板新建 opens its list to the right, level with this menu.
-        let templates = crate::ui::menu_row("create-template", SharedString::from("create-template"))
-            .child(icon("doc", 16., Theme::icon()))
-            .child(tr("从模板新建", "New from template"))
-            .child(div().flex_1())
-            .child(icon("chevron-right", 12., Theme::icon()))
-            .on_click(cx.listener(move |w, _, _, cx| {
-                let at = w.create_menu.as_ref().map(|(_, at)| *at);
-                w.create_menu = None;
-                w.template_menu = at.map(|at| (template_parent.clone(), at + point(px(180.), px(0.))));
-                cx.notify();
-            }));
+        let (doc_parent, md_parent, board_parent) = (parent.clone(), parent.clone(), parent.clone());
         Some(deferred(anchored().anchor(Anchor::TopLeft).position(pos).snap_to_window_with_margin(px(8.)).child(
             popover().id("create-items").occlude().min_w(px(180.)).py(px(crate::ui::MENU_PAD_Y))
                 .on_mouse_down_out(cx.listener(|w, _, _, cx| { w.create_menu = None; cx.notify(); }))
                 .child(row("create-document", "doc", tr("文档", "Document")).on_click(cx.listener(move |w, _, window, cx| w.create_doc(false, doc_parent.clone(), window, cx))))
-                .child(templates)
                 .child(row("create-markdown", "doc-md", "Markdown").on_click(cx.listener(move |w, _, window, cx| w.create_doc(true, md_parent.clone(), window, cx))))
                 .child(row("create-board", "whiteboard", crate::settings::text("画板")).on_click(cx.listener(move |w, _, window, cx| w.create_board(board_parent.clone(), window, cx))))
                 .child(row("create-folder", "folder", tr("文件夹", "Folder")).on_click(cx.listener(move |w, _, window, cx| w.new_folder(folder_parent.clone(), window, cx))))

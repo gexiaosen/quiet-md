@@ -1145,6 +1145,7 @@ pub(crate) fn localize(text: &str, english: bool) -> &str {
         "重命名" => "Rename",
         "创建副本" => "Duplicate",
         "另存为模板" => "Save as template",
+        "选择模板" => "Choose a template",
         "未命名模板" => "Untitled template",
         "复制" => "Copy",
         "粘贴" => "Paste",
